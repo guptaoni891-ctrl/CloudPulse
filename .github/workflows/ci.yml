@@ -14,7 +14,7 @@ jobs:
           POSTGRES_PASSWORD: ci-only-password
           POSTGRES_DB: cloudpulse
         ports: ["5432:5432"]
-        options: --health-cmd 'pg_isready -U cloudpulse' --health-interval 5s --health-timeout 5s --health-retries 10
+        options: --health-cmd=pg_isready --health-interval=5s --health-timeout=5s --health-retries=10
     env:
       CLOUDPULSE_DATABASE_URL: postgresql+psycopg://cloudpulse:ci-only-password@127.0.0.1:5432/cloudpulse
       CLOUDPULSE_ADMIN_TOKEN: ci-only-admin-token-with-at-least-32-characters
