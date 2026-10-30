@@ -1,8 +1,11 @@
 name: CI
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16-alpine
@@ -46,3 +49,17 @@ jobs:
           python scripts/restart_smoke.py
           docker compose --profile test run --build --rm test
           docker compose down -v
+
+  windows:
+    name: Windows Python API and agent
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-dev.lock
+      - name: Run native Windows tests (PostgreSQL-only checks skip)
+        run: python -m pytest -q tests

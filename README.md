@@ -38,21 +38,109 @@ Use an HTTPS reverse proxy and a trusted certificate for remote agents. The agen
 
 Registration assigns a stable UUID. Reuse that ID/key across agent restarts; a machine hostname change does not change identity. Do not register the same agent on every startup.
 
-### Windows (PowerShell)
+## Windows 11: VS Code + Docker Desktop
 
-From a local checkout with Python 3.12+ and Docker Desktop running:
+Run the agent in **native Windows PowerShell**, not WSL or a Docker container, to measure your Windows PC. Docker Desktop runs the API, dashboard and PostgreSQL in Linux containers. Node.js and a local PostgreSQL installation are not required for this workflow.
+
+### 1. Install and check prerequisites
+
+Install [Git for Windows](https://git-scm.com/download/win), [VS Code](https://code.visualstudio.com/), [64-bit Python 3.12](https://www.python.org/downloads/windows/) with the Python launcher, and [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/). Install the VS Code Python extension if you want editor support.
+
+Docker Desktop requires hardware virtualization and its WSL 2 backend. In an **Administrator PowerShell** window, run `wsl --status`. If WSL is missing, run `wsl --install`, restart Windows when prompted, and complete its setup. Open Docker Desktop, enable **Use the WSL 2 based engine**, and use **Linux containers**. Wait until Docker Desktop reports its engine is running.
+
+Open a new ordinary PowerShell terminal and check:
+
+```powershell
+git --version
+py -3.12 --version
+docker version
+docker compose version
+```
+
+`docker version` must show both Client and Server. If `py -3.12` is missing, install Python 3.12 and reopen the terminal. If the server is unavailable, start Docker Desktop before continuing.
+
+### 2. Clone the implementation and open VS Code
+
+Until this PR is merged, clone the implementation branch explicitly:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\source" | Out-Null
+Set-Location "$HOME\source"
+git clone --branch feat/cloudpulse-windows https://github.com/guptaoni891-ctrl/CloudPulse.git CloudPulse
+Set-Location .\CloudPulse
+code .
+```
+
+If the repository is private, use Git's normal secure authentication prompt. If you already have a checkout, preserve your changes, then `git fetch origin` and `git switch --track origin/feat/cloudpulse-windows` (or `git switch feat/cloudpulse-windows` if the branch already exists). Do not reset or delete your checkout. After merge, new clones can use `main`.
+
+In VS Code choose **Terminal → New Terminal → PowerShell**, and make sure the working directory is the repository root. If `code` is not on PATH, use **File → Open Folder** in VS Code instead.
+
+### 3. Start the local platform
+
+Run from the repository root:
+
+```powershell
+py -3.12 scripts/bootstrap.py
+docker compose up --build --detach --wait
+docker compose ps
+Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/v1/health'
+Start-Process 'http://127.0.0.1:8080'
+```
+
+The health response must show `status: ok`. The `migrate` service exiting successfully is expected; DB, backend, frontend and retention should keep running. The first build downloads dependencies and can take several minutes.
+
+Open `.env` **locally in VS Code**, copy only `CLOUDPULSE_ADMIN_TOKEN`, and paste it into the dashboard sign-in form. Never share or commit `.env`. Bootstrap preserves existing credentials and adds the separate runtime DB secret to older configurations. On Windows, keep the checkout in your private user directory and restrict `.env` through its **Properties → Security** permissions; Unix mode 0600 does not establish Windows ACL protection.
+
+Click **Register machine**, enter a name such as `windows11-dev`, and keep the returned host ID and one-time agent API key. The admin token signs into the dashboard; the agent must use its own registered key.
+
+### 4. Run the agent on your PC
+
+Open a **second PowerShell terminal** in VS Code, also at the repository root. No virtual-environment activation or execution-policy changes are needed:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install .\agent
 $env:CLOUDPULSE_SERVER = 'http://127.0.0.1:8000'
-$env:CLOUDPULSE_HOST_ID = '<registered-host-id>'
-$env:CLOUDPULSE_AGENT_KEY = '<registration-key>'
-$env:CLOUDPULSE_DISK_PATH = 'C:\'
+$env:CLOUDPULSE_HOST_ID = Read-Host 'Paste the registered host ID'
+$agentKey = Read-Host 'Paste the one-time agent API key' -AsSecureString
+$env:CLOUDPULSE_AGENT_KEY = [System.Net.NetworkCredential]::new('', $agentKey).Password
+Remove-Variable agentKey
+$env:CLOUDPULSE_INTERVAL = '10'
+$env:CLOUDPULSE_DISK_PATH = "$env:SystemDrive\"
+.\.venv\Scripts\cloudpulse-agent.exe --once
+if ($LASTEXITCODE -ne 0) { throw 'Agent check failed; inspect the error before continuing' }
 .\.venv\Scripts\cloudpulse-agent.exe
 ```
 
-No shell activation or execution-policy changes are necessary. Use Windows Task Scheduler to launch the executable at login if desired, supplying these variables in a protected local wrapper. Do not place credentials in task arguments or a public script. Windows compatibility is designed into the agent; validation in this repository's Linux environment does not establish a Windows runtime test.
+The masked prompt keeps the key out of your command history, while the agent still receives it as a process environment variable. Do not use `setx` or save the key in a tracked script. The foreground agent runs until **Ctrl+C**. These environment variables last only for this terminal; a new terminal needs the same host ID/key again. Reuse the registration across restarts. If the key is lost, rotate it through the admin API or register a new host.
+
+Return to the dashboard, open your machine, and wait about 20–30 seconds for polling and several real samples. Confirm **Online**, CPU/memory/disk readings, network totals and chart lines. To monitor another drive, set `CLOUDPULSE_DISK_PATH` to an existing path such as `'D:\'` before starting the agent. Network counters are cumulative bytes, not bandwidth.
+
+### 5. Stop, restart, and troubleshoot
+
+Stop the agent with Ctrl+C, then clear the secret from that terminal:
+
+```powershell
+Remove-Item Env:CLOUDPULSE_AGENT_KEY -ErrorAction SilentlyContinue
+docker compose logs --tail 100 migrate backend retention
+docker compose down
+# Start the platform again later without deleting stored data:
+docker compose up --detach --wait
+```
+
+`docker compose down` preserves PostgreSQL data. **Do not use `docker compose down -v` unless you intend to delete all stored data.** To restart monitoring, repeat the agent environment-variable commands with the original registration and run the agent again.
+
+- **Port 8000/8080 already in use:** stop the conflicting local service; inspect with `Get-NetTCPConnection -State Listen -LocalPort 8000,8080 -ErrorAction SilentlyContinue`. Keep Compose's `127.0.0.1` bindings.
+- **401 from the agent:** check the host ID/key pair and whether the host is disabled. Do not substitute the dashboard admin token for the agent key.
+- **No charts/offline:** keep the agent running, check its terminal, confirm the selected disk exists, and check Windows date/time synchronization. A one-shot run will become offline after the heartbeat timeout.
+- **Docker pipe/engine errors:** start Docker Desktop, confirm Linux containers/WSL 2, and rerun `docker version`.
+- **Backend startup failure:** inspect `docker compose logs migrate backend db`. Do not delete the database volume as a routine troubleshooting step.
+
+All published services remain on **localhost**. No router forwarding, public bind addresses or firewall exceptions are needed. Internet deployment remains blocked by the [production security requirements](docs/PRODUCTION_REVIEW.md).
+
+### Windows verification status
+
+The workflow includes a `windows-latest` Python 3.12 job for native API/agent tests; the Linux job validates frontend builds and the PostgreSQL/Compose deployment. A Linux test run does not prove Windows execution. Confirm the Windows job's result in GitHub Actions and perform the PC steps above before calling Windows support verified. Native Docker Desktop/VS Code setup is a manual check, not covered by hosted-runner tests.
 
 ## What it does
 
