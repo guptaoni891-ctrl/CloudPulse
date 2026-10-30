@@ -1,0 +1,43 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cloudpulse
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: cloudpulse
+        ports: ["5432:5432"]
+        options: --health-cmd 'pg_isready -U cloudpulse' --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CLOUDPULSE_DATABASE_URL: postgresql+psycopg://cloudpulse:ci-only-password@127.0.0.1:5432/cloudpulse
+      CLOUDPULSE_ADMIN_TOKEN: ci-only-admin-token-with-at-least-32-characters
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: pip install -r requirements-dev.lock
+      - run: ruff check backend agent tests scripts
+      - run: pytest -q tests
+      - run: alembic -c backend/alembic.ini upgrade head
+      - run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log &
+          API_PID=$!
+          trap 'kill "$API_PID"' EXIT
+          python scripts/smoke.py
+      - run: npm ci && npm run build
+        working-directory: frontend
+      - run: |
+          python scripts/bootstrap.py
+          docker compose up --build -d --wait
+          python scripts/compose_smoke.py
+          docker compose down -v
