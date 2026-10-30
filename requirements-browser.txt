@@ -1,0 +1,2 @@
+# Optional browser smoke; installed separately from application dependencies.
+playwright==1.64.1
