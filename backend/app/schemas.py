@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -14,24 +14,27 @@ class HostCreate(Schema):
 
 
 class HostUpdate(Schema):
-    enabled: bool
+    enabled: bool = Field(strict=True)
 
 
 class Sample(Schema):
     sample_id: UUID
     timestamp: datetime
-    cpu: float = Field(ge=0, le=100)
-    memory: float = Field(ge=0, le=100)
-    disk: float = Field(ge=0, le=100)
-    network_sent_bytes: int = Field(ge=0, le=9223372036854775807)
-    network_recv_bytes: int = Field(ge=0, le=9223372036854775807)
+    cpu: float = Field(ge=0, le=100, strict=True)
+    memory: float = Field(ge=0, le=100, strict=True)
+    disk: float = Field(ge=0, le=100, strict=True)
+    network_sent_bytes: int = Field(ge=0, le=9223372036854775807, strict=True)
+    network_recv_bytes: int = Field(ge=0, le=9223372036854775807, strict=True)
 
     @field_validator("timestamp")
     @classmethod
     def aware(cls, value):
         if value.tzinfo is None:
             raise ValueError("timestamp must include timezone")
-        return value
+        try:
+            return value.astimezone(UTC)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("timestamp outside supported UTC range") from exc
 
 
 class MetricOut(Sample):

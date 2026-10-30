@@ -40,3 +40,56 @@ def test_exhaustion_is_bounded():
             client, "https://example.com", {"sample_id": "one"}, attempts=3, sleep=lambda _: None
         )
     assert len(requests) == 3
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com",
+        "http://localhost?key=secret",
+        "https://example.com/#fragment",
+        "http://localhost:bad",
+        "https://user:password@example.com",
+        "http://localhost:0",
+        "http://local\nhost",
+    ],
+)
+def test_invalid_server_urls_fail_before_sending_credentials(url):
+    from cloudpulse_agent.main import server_url
+
+    with pytest.raises(ValueError):
+        server_url(url)
+
+
+@pytest.mark.parametrize("status", [301, 400, 405, 413])
+def test_permanent_http_errors_stop_without_retry(status):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError):
+            send(client, "https://example.com", {"sample_id": "one"}, sleep=lambda _: None)
+    assert len(calls) == 1
+
+
+def test_cli_canonicalizes_host_uuid(monkeypatch):
+    import sys
+    from uuid import uuid4
+
+    from cloudpulse_agent import main as module
+
+    host_id = str(uuid4())
+    captured = []
+    monkeypatch.setenv("CLOUDPULSE_HOST_ID", host_id.upper())
+    monkeypatch.setenv("CLOUDPULSE_AGENT_KEY", "test-key")
+    monkeypatch.setenv("CLOUDPULSE_SERVER", "http://127.0.0.1:8000")
+    monkeypatch.setattr(sys, "argv", ["cloudpulse-agent", "--once"])
+    monkeypatch.setattr(module, "collect", lambda _: {"sample_id": "test"})
+    monkeypatch.setattr(module, "send", lambda client, url, payload: captured.append(url) or True)
+    with pytest.raises(SystemExit) as result:
+        module.main()
+    assert result.value.code == 0
+    assert captured == [f"http://127.0.0.1:8000/api/v1/hosts/{host_id}/metrics"]

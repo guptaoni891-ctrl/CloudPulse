@@ -56,15 +56,23 @@ const fmt = (v: number | undefined) =>
 const date = (s: string | null) =>
   s ? new Date(s).toLocaleString() : "Awaiting first sample";
 
+function readHostHash() {
+  const value = window.location.hash.slice(1);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    value,
+  )
+    ? value
+    : null;
+}
+
 function App() {
   const requestVersion = useRef(0);
+  const sessionVersion = useRef(0);
   const [token, setToken] = useState("");
   const [draft, setDraft] = useState("");
   const [hosts, setHosts] = useState<Host[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [selected, setSelected] = useState<string | null>(
-    window.location.hash.slice(1) || null,
-  );
+  const [selected, setSelected] = useState<string | null>(readHostHash());
   const [page, setPage] = useState<"hosts" | "alerts">("hosts");
   const [history, setHistory] = useState<Metric[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
@@ -83,6 +91,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const current = hosts.find((h) => h.id === selected);
   async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const session = sessionVersion.current;
     const response = await fetch(`/api/v1${path}`, {
       signal: AbortSignal.timeout(15000),
       ...options,
@@ -92,19 +101,21 @@ function App() {
         ...options.headers,
       },
     });
+    const body = await response.json().catch(() => ({}));
+    if (session !== sessionVersion.current)
+      throw new DOMException("Session ended", "AbortError");
     if (!response.ok) {
       if (response.status === 401)
         throw new Error(
           "Authentication failed. Check the admin token and sign in again.",
         );
-      const body = await response.json().catch(() => ({}));
       throw new Error(
         typeof body.detail === "string"
           ? body.detail
           : `Request failed (${response.status})`,
       );
     }
-    return response.json();
+    return body;
   }
   async function refresh() {
     const version = ++requestVersion.current;
@@ -112,7 +123,11 @@ function App() {
     try {
       const [h, a] = await Promise.all([
         api<Host[]>("/hosts"),
-        api<Alert[]>("/alerts"),
+        api<Alert[]>(
+          selected
+            ? `/alerts?host_id=${encodeURIComponent(selected)}`
+            : "/alerts",
+        ),
       ]);
       let data: Metric[] = [];
       let r: Rule[] = [];
@@ -139,23 +154,44 @@ function App() {
   useEffect(() => {
     if (!token) return;
     let active = true;
-    // Ignore stale responses when switching hosts or signing out.
-    const run = () => {
-      if (active) void refresh();
+    let timer: ReturnType<typeof setTimeout>;
+    // Schedule after completion, so slow responses cannot starve polling updates.
+    const run = async () => {
+      await refresh();
+      if (active) timer = setTimeout(run, 10000);
     };
-    run();
-    const timer = setInterval(run, 10000);
+    void run();
     return () => {
       active = false;
       requestVersion.current++;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
   }, [token, selected, range]);
   useEffect(() => {
-    const handler = () => setSelected(window.location.hash.slice(1) || null);
+    const handler = () => setSelected(readHostHash());
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
   }, []);
+  function signOut() {
+    sessionVersion.current++;
+    requestVersion.current++;
+    setToken("");
+    setDraft("");
+    setRegistration(null);
+    setHosts([]);
+    setAlerts([]);
+    setHistory([]);
+    setRules([]);
+    setShowRegister(false);
+    setName("");
+    setError("");
+    setUpdated(null);
+    setLoading(false);
+    setBusy(false);
+    setPage("hosts");
+    setSelected(null);
+    window.location.hash = "";
+  }
   function navigate(id: string | null) {
     setHistory([]);
     setRules([]);
@@ -165,6 +201,7 @@ function App() {
   }
   async function register(e: React.FormEvent) {
     e.preventDefault();
+    const session = sessionVersion.current;
     setBusy(true);
     try {
       const r = await api<{ host: Host; api_key: string }>("/hosts", {
@@ -176,13 +213,14 @@ function App() {
       setShowRegister(false);
       await refresh();
     } catch (e) {
-      setError((e as Error).message);
+      if (session === sessionVersion.current) setError((e as Error).message);
     } finally {
-      setBusy(false);
+      if (session === sessionVersion.current) setBusy(false);
     }
   }
   async function saveRule(e: React.FormEvent) {
     e.preventDefault();
+    const session = sessionVersion.current;
     setBusy(true);
     try {
       await api(`/hosts/${selected}/rules`, {
@@ -191,13 +229,14 @@ function App() {
       });
       await refresh();
     } catch (e) {
-      setError((e as Error).message);
+      if (session === sessionVersion.current) setError((e as Error).message);
     } finally {
-      setBusy(false);
+      if (session === sessionVersion.current) setBusy(false);
     }
   }
   async function toggleHost() {
     if (!current) return;
+    const session = sessionVersion.current;
     setBusy(true);
     try {
       await api(`/hosts/${current.id}`, {
@@ -206,9 +245,9 @@ function App() {
       });
       await refresh();
     } catch (e) {
-      setError((e as Error).message);
+      if (session === sessionVersion.current) setError((e as Error).message);
     } finally {
-      setBusy(false);
+      if (session === sessionVersion.current) setBusy(false);
     }
   }
   if (!token)
@@ -298,17 +337,7 @@ function App() {
         <div className="aside-footer">
           <span className="dot" />
           Local workspace
-          <button
-            onClick={() => {
-              setToken("");
-              setRegistration(null);
-              setHosts([]);
-              setAlerts([]);
-              setHistory([]);
-              setRules([]);
-            }}
-            aria-label="Sign out"
-          >
+          <button onClick={signOut} aria-label="Sign out">
             <LogOut size={17} />
           </button>
         </div>
@@ -336,8 +365,7 @@ function App() {
         <div className="content">
           {error && (
             <div role="alert" className="error">
-              {error}{" "}
-              <button onClick={() => setToken("")}>Sign in again</button>
+              {error} <button onClick={signOut}>Sign in again</button>
             </div>
           )}
           {registration && (
@@ -595,7 +623,12 @@ function App() {
                 {history.length ? (
                   <div className="chart">
                     <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={history}>
+                      <AreaChart
+                        data={history.map((m) => ({
+                          ...m,
+                          time: Date.parse(m.timestamp),
+                        }))}
+                      >
                         <defs>
                           <linearGradient id="blue" x1="0" y1="0" x2="0" y2="1">
                             <stop
@@ -616,7 +649,10 @@ function App() {
                           vertical={false}
                         />
                         <XAxis
-                          dataKey="timestamp"
+                          dataKey="time"
+                          type="number"
+                          scale="time"
+                          domain={["dataMin", "dataMax"]}
                           tickFormatter={(v) =>
                             new Date(v).toLocaleTimeString([], {
                               hour: "2-digit",
@@ -637,7 +673,9 @@ function App() {
                             border: "1px solid #303b4e",
                             borderRadius: 8,
                           }}
-                          labelFormatter={(v) => date(String(v))}
+                          labelFormatter={(v) =>
+                            new Date(Number(v)).toLocaleString()
+                          }
                         />
                         <Area
                           type="monotone"
@@ -727,7 +765,9 @@ function App() {
             <section className="panel">
               <div className="panel-heading">
                 <h2>Recent events</h2>
-                <span className="muted">Latest 100 workspace transitions</span>
+                <span className="muted">
+                  Latest 100 {selected ? "host" : "workspace"} transitions
+                </span>
               </div>
               {!visibleAlerts.length ? (
                 <div className="empty">

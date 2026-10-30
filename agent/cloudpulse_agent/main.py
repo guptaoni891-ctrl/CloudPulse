@@ -17,6 +17,31 @@ import psutil
 log = logging.getLogger("cloudpulse-agent")
 
 
+def server_url(value: str) -> str:
+    parsed = urlparse(value)
+    # Accessing .port also validates malformed/non-numeric port values.
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("CLOUDPULSE_SERVER has an invalid port") from exc
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or any(char.isspace() or ord(char) < 32 for char in value)
+        or port == 0
+    ):
+        raise ValueError(
+            "CLOUDPULSE_SERVER must be an HTTP(S) base URL without credentials, query or fragment"
+        )
+    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("Use HTTPS when sending credentials to a remote server")
+    return value.rstrip("/")
+
+
 def collect(disk_path: str) -> dict:
     network = psutil.net_io_counters()
     return {
@@ -34,7 +59,7 @@ def send(client, url, sample, attempts=5, sleep=time.sleep):
     for attempt in range(attempts):
         try:
             response = client.post(url, json=sample)
-            if response.status_code in (401, 403, 404, 422):
+            if 300 <= response.status_code < 500 and response.status_code not in (408, 429):
                 raise RuntimeError(
                     f"Ingestion rejected ({response.status_code}); check agent configuration and clock"
                 )
@@ -61,21 +86,15 @@ def main():
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    base = os.getenv("CLOUDPULSE_SERVER", "http://127.0.0.1:8000").rstrip("/")
-    parsed = urlparse(base)
-    if (
-        parsed.scheme not in ("http", "https")
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-    ):
-        parser.error("CLOUDPULSE_SERVER must be an HTTP(S) URL without credentials")
-    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-        parser.error("Use HTTPS when sending credentials to a remote server")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    try:
+        base = server_url(os.getenv("CLOUDPULSE_SERVER", "http://127.0.0.1:8000"))
+    except ValueError as exc:
+        parser.error(str(exc))
     host_id = os.getenv("CLOUDPULSE_HOST_ID", "")
     key = os.getenv("CLOUDPULSE_AGENT_KEY", "")
     try:
-        UUID(host_id)
+        host_id = str(UUID(host_id))
         interval = float(os.getenv("CLOUDPULSE_INTERVAL", "10"))
         if not 2 <= interval <= 3600:
             raise ValueError()
@@ -86,7 +105,7 @@ def main():
     disk_path = os.getenv("CLOUDPULSE_DISK_PATH", Path.home().anchor)
     url = f"{base}/api/v1/hosts/{host_id}/metrics"
     try:
-        with httpx.Client(headers={"X-API-Key": key}, timeout=10) as client:
+        with httpx.Client(headers={"X-API-Key": key}, timeout=10, follow_redirects=False) as client:
             while True:
                 tick = time.monotonic()
                 ok = send(client, url, collect(disk_path))
@@ -95,7 +114,7 @@ def main():
                 time.sleep(max(0, interval - (time.monotonic() - tick)))
     except KeyboardInterrupt:
         log.info(json.dumps({"event": "agent_stopped"}))
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, psutil.Error) as exc:
         log.error(json.dumps({"event": "agent_failed", "error": str(exc)}))
         raise SystemExit(1) from exc
 

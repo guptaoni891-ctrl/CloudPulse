@@ -165,3 +165,118 @@ def test_future_and_retention(client, admin, registered):
     assert client.post("/api/v1/maintenance/retention").status_code == 401
     result = client.post("/api/v1/maintenance/retention", headers=admin).json()
     assert result["deleted_metrics"] == 1
+
+
+def test_offset_history_uses_utc(client, admin, registered):
+    moment = datetime.now(UTC) - timedelta(minutes=10)
+    assert ingest(client, registered, sample(timestamp=moment.isoformat())).status_code == 202
+    from datetime import timezone
+
+    zone = timezone(timedelta(hours=4))
+    response = client.get(
+        f"/api/v1/hosts/{registered['host']['id']}/metrics",
+        headers=admin,
+        params={
+            "start": (moment - timedelta(seconds=1)).astimezone(zone).isoformat(),
+            "end": (moment + timedelta(seconds=1)).astimezone(zone).isoformat(),
+        },
+    )
+    assert len(response.json()) == 1
+
+
+@pytest.mark.parametrize("timestamp", ["0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00"])
+def test_extreme_timestamps_are_validation_errors(client, registered, timestamp):
+    assert ingest(client, registered, sample(timestamp=timestamp)).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"cpu": True}, {"memory": "20"}, {"network_sent_bytes": False}, {"network_recv_bytes": "100"}],
+)
+def test_telemetry_types_are_strict(client, registered, changes):
+    assert ingest(client, registered, sample(**changes)).status_code == 422
+
+
+def test_sensitive_responses_are_not_cacheable(client, admin, registered):
+    for response in [
+        client.get("/api/v1/hosts", headers=admin),
+        client.get("/api/v1/hosts"),
+        client.post(f"/api/v1/hosts/{registered['host']['id']}/rotate-key", headers=admin),
+    ]:
+        assert response.headers["cache-control"] == "no-store"
+
+
+def test_request_body_is_bounded(client, admin):
+    result = client.post("/api/v1/hosts", headers=admin, content=b" " * 17000)
+    assert result.status_code == 413
+    assert result.headers["cache-control"] == "no-store"
+
+
+def test_host_overview_uses_one_query(client, admin, registered):
+    from sqlalchemy import event
+
+    for index in range(3):
+        client.post("/api/v1/hosts", headers=admin, json={"name": f"host-{index}"})
+    statements = []
+
+    def record(*args):
+        statements.append(args[2])
+
+    event.listen(app.state.test_engine, "before_cursor_execute", record)
+    try:
+        result = client.get("/api/v1/hosts", headers=admin)
+    finally:
+        event.remove(app.state.test_engine, "before_cursor_execute", record)
+    assert result.status_code == 200 and len(result.json()) == 4
+    assert len(statements) == 1
+
+
+def test_chunked_request_body_cannot_bypass_size_limit(client, admin):
+    result = client.post("/api/v1/hosts", headers=admin, content=iter([b" " * 9000, b" " * 9000]))
+    assert result.status_code == 413
+
+
+@pytest.mark.parametrize("boundary", ["0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00"])
+def test_extreme_history_bounds_return_422(client, admin, registered, boundary):
+    path = f"/api/v1/hosts/{registered['host']['id']}/metrics"
+    params = {"start": boundary} if boundary.startswith("0001") else {"end": boundary}
+    assert client.get(path, headers=admin, params=params).status_code == 422
+
+
+def test_agent_keys_are_scoped_to_one_host(client, admin, registered):
+    other = client.post("/api/v1/hosts", headers=admin, json={"name": "other-host"}).json()
+    result = client.post(
+        f"/api/v1/hosts/{other['host']['id']}/metrics",
+        headers={"X-API-Key": registered["api_key"]},
+        json=sample(),
+    )
+    assert result.status_code == 401
+    assert client.get(f"/api/v1/hosts/{other['host']['id']}/metrics", headers=admin).json() == []
+
+
+@pytest.mark.parametrize(
+    "method,path,payload",
+    [
+        ("get", "/alerts", None),
+        ("get", "/hosts/{id}/rules", None),
+        ("put", "/hosts/{id}/rules", {"metric": "cpu", "threshold": 90}),
+        ("patch", "/hosts/{id}", {"enabled": False}),
+        ("post", "/hosts/{id}/rotate-key", None),
+        ("post", "/maintenance/retention", None),
+    ],
+)
+def test_management_routes_require_admin(client, registered, method, path, payload):
+    path = path.format(id=registered["host"]["id"])
+    response = client.request(
+        method, "/api/v1" + path, json=payload, headers={"X-API-Key": registered["api_key"]}
+    )
+    assert response.status_code == 401
+
+
+def test_invalid_configuration_never_echoes_secrets():
+    from app.config import Settings
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as error:
+        Settings(admin_token="secret-short-value")
+    assert "secret-short-value" not in str(error.value)

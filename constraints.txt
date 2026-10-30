@@ -22,7 +22,7 @@ pydantic==2.14.2
 pydantic-settings==2.16.2
 pydantic_core==2.50.2
 Pygments==2.21.0
-pytest==8.4.2
+pytest==9.0.3
 python-dotenv==1.2.4
 ruff==0.17.3
 SQLAlchemy==2.1.6

@@ -56,6 +56,7 @@ class Rule(Base):
 
 class Alert(Base):
     __tablename__ = "alerts"
+    __table_args__ = (Index("ix_alerts_timestamp", "timestamp"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     host_id: Mapped[str] = mapped_column(ForeignKey("hosts.id"), index=True)
     rule_id: Mapped[int] = mapped_column(ForeignKey("rules.id"))
